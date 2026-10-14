@@ -96,6 +96,46 @@ async function currentUser(req) {
 
 function publicUser(user) { return { id: user.id, email: user.email, role: user.role }; }
 
+async function registerAccount(data, role, res) {
+  const email = emailValue(data.email);
+  if (role === 'admin' && !adminEmails.has(email)) {
+    throw Object.assign(new Error('This email is not approved for TDCI admin access. Ask the church to add it to ADMIN_EMAILS.'), { status: 403 });
+  }
+  if (role === 'member' && adminEmails.has(email)) {
+    throw Object.assign(new Error('This email is reserved for TDCI admin access. Choose the Church admin sign-in.'), { status: 403 });
+  }
+  if (data.privacyConsent !== true || data.privacyPolicyVersion !== policyVersion) {
+    throw Object.assign(new Error('Review and accept the current privacy policy to create a cloud account.'), { status: 400 });
+  }
+  const passwordHash = await hashPassword(data.password);
+  try {
+    const inserted = await pool.query(`INSERT INTO tdci_users (email, password_hash, role, privacy_consent_version)
+      VALUES ($1, $2, $3, $4) RETURNING id, email, role`, [email, passwordHash, role, policyVersion]);
+    await createSession(res, inserted.rows[0].id);
+    json(res, 201, { user: publicUser(inserted.rows[0]) });
+  } catch (error) {
+    if (error.code === '23505') throw Object.assign(new Error('An account with that email already exists. Sign in instead.'), { status: 409 });
+    throw error;
+  }
+}
+
+async function loginAccount(data, role, res) {
+  const email = emailValue(data.email);
+  const result = await pool.query('SELECT id, email, role, password_hash FROM tdci_users WHERE email = $1', [email]);
+  const account = result.rows[0];
+  const allowedRole = role === 'admin'
+    ? account?.role === 'admin' && adminEmails.has(email)
+    : account?.role === 'member';
+  if (!allowedRole || !(await verifyPassword(String(data.password || ''), account?.password_hash))) {
+    const message = role === 'admin'
+      ? 'Admin sign-in could not be verified. Check your details and TDCI admin approval.'
+      : 'Member sign-in could not be verified. Use Church admin sign-in for a TDCI administrator account.';
+    throw Object.assign(new Error(message), { status: 401 });
+  }
+  await createSession(res, account.id);
+  json(res, 200, { user: publicUser(account) });
+}
+
 async function initializeDatabase() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required.');
   await pool.query(`
@@ -124,6 +164,13 @@ async function initializeDatabase() {
       month text PRIMARY KEY CHECK (month ~ '^\\d{4}-(0[1-9]|1[0-2])$'),
       targets jsonb NOT NULL,
       focus text NOT NULL DEFAULT '',
+      updated_by uuid REFERENCES tdci_users(id) ON DELETE SET NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS tdci_church_resources (
+      id text PRIMARY KEY DEFAULT 'main' CHECK (id = 'main'),
+      prayer_url text NOT NULL DEFAULT '',
+      messages_url text NOT NULL DEFAULT '',
       updated_by uuid REFERENCES tdci_users(id) ON DELETE SET NULL,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
@@ -187,30 +234,19 @@ async function route(req, res) {
   }
 
   if (url.pathname === '/api/health' && req.method === 'GET') { await pool.query('SELECT 1'); json(res, 200, { ok: true, service: 'TDCI Discipleship API' }); return; }
+  if (url.pathname === '/api/church/resources' && req.method === 'GET') {
+    const result = await pool.query('SELECT prayer_url, messages_url, updated_at FROM tdci_church_resources WHERE id = $1', ['main']);
+    const row = result.rows[0];
+    json(res, 200, { resources: { prayerUrl: row?.prayer_url || '', messagesUrl: row?.messages_url || '' }, updated_at: row?.updated_at || null });
+    return;
+  }
   if (!url.pathname.startsWith('/api/')) { json(res, 404, { error: 'Not found.' }); return; }
 
   const data = ['POST', 'PUT'].includes(req.method) ? await body(req) : {};
-  if (url.pathname === '/api/auth/register' && req.method === 'POST') {
-    const email = emailValue(data.email);
-    if (data.privacyConsent !== true || data.privacyPolicyVersion !== policyVersion) throw Object.assign(new Error('Review and accept the current privacy policy to create a cloud account.'), { status: 400 });
-    const passwordHash = await hashPassword(data.password);
-    try {
-      const inserted = await pool.query(`INSERT INTO tdci_users (email, password_hash, role, privacy_consent_version)
-        VALUES ($1, $2, $3, $4) RETURNING id, email, role`, [email, passwordHash, adminEmails.has(email) ? 'admin' : 'member', policyVersion]);
-      await createSession(res, inserted.rows[0].id);
-      json(res, 201, { user: publicUser(inserted.rows[0]) }); return;
-    } catch (error) {
-      if (error.code === '23505') throw Object.assign(new Error('An account with that email already exists. Sign in instead.'), { status: 409 });
-      throw error;
-    }
-  }
-  if (url.pathname === '/api/auth/login' && req.method === 'POST') {
-    const email = emailValue(data.email);
-    const result = await pool.query('SELECT id, email, role, password_hash FROM tdci_users WHERE email = $1', [email]);
-    if (!result.rows[0] || !(await verifyPassword(String(data.password || ''), result.rows[0].password_hash))) throw Object.assign(new Error('Email or password is incorrect.'), { status: 401 });
-    await createSession(res, result.rows[0].id);
-    json(res, 200, { user: publicUser(result.rows[0]) }); return;
-  }
+  if (url.pathname === '/api/auth/register' && req.method === 'POST') { await registerAccount(data, 'member', res); return; }
+  if (url.pathname === '/api/auth/admin/register' && req.method === 'POST') { await registerAccount(data, 'admin', res); return; }
+  if (url.pathname === '/api/auth/login' && req.method === 'POST') { await loginAccount(data, 'member', res); return; }
+  if (url.pathname === '/api/auth/admin/login' && req.method === 'POST') { await loginAccount(data, 'admin', res); return; }
   if (url.pathname === '/api/auth/me' && req.method === 'GET') {
     const user = await currentUser(req);
     if (!user) throw Object.assign(new Error('Sign in to continue.'), { status: 401 });
@@ -240,6 +276,26 @@ async function route(req, res) {
     const result = await pool.query(`INSERT INTO tdci_member_states (user_id, state, updated_at) VALUES ($1, $2, now())
       ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = now() RETURNING updated_at`, [user.id, state]);
     json(res, 200, { ok: true, updated_at: result.rows[0].updated_at }); return;
+  }
+  if (url.pathname === '/api/church/resources' && req.method === 'PUT') {
+    if (user.role !== 'admin') throw Object.assign(new Error('Only a TDCI administrator can publish church links.'), { status: 403 });
+    const validLink = (value, name) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      let parsed;
+      try { parsed = new URL(raw); } catch { throw Object.assign(new Error(`${name} must be a valid HTTPS link.`), { status: 400 }); }
+      if (parsed.protocol !== 'https:' || raw.length > 1000) throw Object.assign(new Error(`${name} must be a valid HTTPS link up to 1,000 characters.`), { status: 400 });
+      return parsed.toString();
+    };
+    const prayerUrl = validLink(data.prayerUrl, 'Prayer link');
+    const messagesUrl = validLink(data.messagesUrl, 'Messages link');
+    const result = await pool.query(`INSERT INTO tdci_church_resources (id, prayer_url, messages_url, updated_by, updated_at)
+      VALUES ('main', $1, $2, $3, now()) ON CONFLICT (id) DO UPDATE SET prayer_url = EXCLUDED.prayer_url,
+      messages_url = EXCLUDED.messages_url, updated_by = EXCLUDED.updated_by, updated_at = now()
+      RETURNING prayer_url, messages_url, updated_at`, [prayerUrl, messagesUrl, user.id]);
+    const row = result.rows[0];
+    json(res, 200, { resources: { prayerUrl: row.prayer_url, messagesUrl: row.messages_url }, updated_at: row.updated_at });
+    return;
   }
   const planMatch = url.pathname.match(/^\/api\/plans\/(\d{4}-(?:0[1-9]|1[0-2]))$/);
   if (planMatch && req.method === 'GET') {
