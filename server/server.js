@@ -6,12 +6,20 @@ import { Pool } from 'pg';
 
 const scrypt = promisify(scryptCallback);
 const port = Number(process.env.PORT || 10000);
+const pgPoolMax = Math.max(1, Math.min(50, Number.parseInt(process.env.PG_POOL_MAX || '8', 10) || 8));
+const pgConnectionTimeoutMillis = Math.max(1_000, Math.min(30_000, Number.parseInt(process.env.PG_CONNECTION_TIMEOUT_MS || '5000', 10) || 5_000));
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined,
-  max: 8,
-  idleTimeoutMillis: 30_000
+  max: pgPoolMax,
+  min: 0,
+  connectionTimeoutMillis: pgConnectionTimeoutMillis,
+  idleTimeoutMillis: 30_000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10_000,
+  maxUses: 7_500
 });
+pool.on('error', error => console.error('Unexpected idle PostgreSQL connection error:', error.message));
 const publicDir = new URL('./public/', import.meta.url);
 const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS || 'https://localhost,capacitor://localhost,http://localhost,http://127.0.0.1:4173,http://localhost:4173')
   .split(',').map(value => value.trim()).filter(Boolean));
@@ -160,6 +168,17 @@ async function initializeDatabase() {
       state jsonb NOT NULL DEFAULT '{}'::jsonb,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS tdci_member_entries (
+      user_id uuid NOT NULL REFERENCES tdci_users(id) ON DELETE CASCADE,
+      entry_id text NOT NULL,
+      kind text NOT NULL CHECK (kind IN ('prayer', 'scripture', 'obedience')),
+      activity_date date NOT NULL,
+      record jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, entry_id)
+    );
+    CREATE INDEX IF NOT EXISTS tdci_member_entries_month_idx ON tdci_member_entries (user_id, activity_date, kind);
+    CREATE INDEX IF NOT EXISTS tdci_member_entries_page_idx ON tdci_member_entries (user_id, activity_date, entry_id);
     CREATE TABLE IF NOT EXISTS tdci_monthly_plans (
       month text PRIMARY KEY CHECK (month ~ '^\\d{4}-(0[1-9]|1[0-2])$'),
       targets jsonb NOT NULL,
@@ -175,6 +194,13 @@ async function initializeDatabase() {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
   `);
+  await pool.query(`INSERT INTO tdci_member_entries (user_id, entry_id, kind, activity_date, record)
+    SELECT s.user_id, e.record->>'id', e.record->>'kind', (e.record->>'date')::date, e.record
+    FROM tdci_member_states s
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(s.state->'entries') = 'array' THEN s.state->'entries' ELSE '[]'::jsonb END) AS e(record)
+    WHERE e.record->>'id' IS NOT NULL AND e.record->>'kind' IN ('prayer', 'scripture', 'obedience') AND e.record->>'date' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+    ON CONFLICT (user_id, entry_id) DO NOTHING`);
+  await pool.query(`UPDATE tdci_member_states SET state = state - 'entries', updated_at = now() WHERE state ? 'entries'`);
 }
 
 async function deleteAccount(userId) {
@@ -191,9 +217,22 @@ async function deleteAccount(userId) {
 
 function validState(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw Object.assign(new Error('Invalid member state.'), { status: 400 });
+  if (value.entries !== undefined && !Array.isArray(value.entries)) throw Object.assign(new Error('Member entries must be a list.'), { status: 400 });
+  for (const entry of value.entries || []) validMemberEntry(entry);
   const encoded = JSON.stringify(value);
   if (Buffer.byteLength(encoded) > 900_000) throw Object.assign(new Error('Member state is too large.'), { status: 413 });
   return value;
+}
+
+function validMemberEntry(entry) {
+  const parsedDate = typeof entry?.date === 'string' ? new Date(`${entry.date}T12:00:00Z`) : null;
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !['prayer', 'scripture', 'obedience'].includes(entry.kind) ||
+      typeof entry.id !== 'string' || !entry.id.length || entry.id.length > 120 || !/^\d{4}-\d{2}-\d{2}$/.test(entry.date || '') ||
+      !parsedDate || Number.isNaN(parsedDate.valueOf()) || parsedDate.toISOString().slice(0, 10) !== entry.date) {
+    throw Object.assign(new Error('One of the member entries is invalid.'), { status: 400 });
+  }
+  if (Buffer.byteLength(JSON.stringify(entry)) > 16_384) throw Object.assign(new Error('An activity record is too large.'), { status: 413 });
+  return entry;
 }
 
 async function route(req, res) {
@@ -204,7 +243,7 @@ async function route(req, res) {
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   }
   if (req.method === 'OPTIONS' && url.pathname.startsWith('/api/')) { res.writeHead(204); res.end(); return; }
 
@@ -269,13 +308,73 @@ async function route(req, res) {
   if (!user) throw Object.assign(new Error('Sign in to continue.'), { status: 401 });
   if (url.pathname === '/api/me/state' && req.method === 'GET') {
     const result = await pool.query('SELECT state, updated_at FROM tdci_member_states WHERE user_id = $1', [user.id]);
-    json(res, 200, { state: result.rows[0]?.state || { entries: [], reflections: {}, timer: null }, updated_at: result.rows[0]?.updated_at || null }); return;
+    const saved = result.rows[0]?.state || { reflections: {}, timer: null };
+    if (url.searchParams.get('includeEntries') === 'false') {
+      json(res, 200, { state: saved, updated_at: result.rows[0]?.updated_at || null }); return;
+    }
+    const entries = await pool.query('SELECT record FROM tdci_member_entries WHERE user_id = $1 ORDER BY activity_date, entry_id', [user.id]);
+    json(res, 200, { state: { ...saved, entries: entries.rows.map(row => row.record) }, updated_at: result.rows[0]?.updated_at || null }); return;
+  }
+  const memberMonthMatch = url.pathname.match(/^\/api\/me\/entries\/(\d{4}-(?:0[1-9]|1[0-2]))$/);
+  if (memberMonthMatch && req.method === 'GET') {
+    const month = monthValue(memberMonthMatch[1]);
+    const requestedLimit = Number.parseInt(url.searchParams.get('limit') || '100', 10);
+    const limit = Number.isInteger(requestedLimit) ? Math.max(1, Math.min(250, requestedLimit)) : 100;
+    const afterDate = url.searchParams.get('afterDate');
+    const afterId = url.searchParams.get('afterId');
+    if ((afterDate && !/^\d{4}-\d{2}-\d{2}$/.test(afterDate)) || (afterId && afterId.length > 120)) throw Object.assign(new Error('Invalid entry page cursor.'), { status: 400 });
+    const result = await pool.query(`SELECT entry_id, activity_date, record FROM tdci_member_entries
+      WHERE user_id = $1 AND activity_date >= ($2 || '-01')::date AND activity_date < (($2 || '-01')::date + interval '1 month')
+      AND ($3::date IS NULL OR (activity_date, entry_id) > ($3::date, $4::text))
+      ORDER BY activity_date, entry_id LIMIT $5`, [user.id, month, afterDate || null, afterId || '', limit + 1]);
+    const hasMore = result.rows.length > limit;
+    const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+    const last = rows[rows.length - 1];
+    const nextCursor = hasMore && last ? { date: String(last.activity_date).slice(0, 10), id: last.entry_id } : null;
+    json(res, 200, { entries: rows.map(row => row.record), nextCursor });
+    return;
+  }
+  if (url.pathname === '/api/me/entries' && req.method === 'PUT') {
+    const entry = validMemberEntry(data.entry);
+    await pool.query(`INSERT INTO tdci_member_entries (user_id, entry_id, kind, activity_date, record)
+      VALUES ($1, $2, $3, $4::date, $5) ON CONFLICT (user_id, entry_id)
+      DO UPDATE SET kind = EXCLUDED.kind, activity_date = EXCLUDED.activity_date, record = EXCLUDED.record`,
+    [user.id, entry.id, entry.kind, entry.date, entry]);
+    json(res, 200, { ok: true });
+    return;
+  }
+  const memberEntryMatch = url.pathname.match(/^\/api\/me\/entries\/([^/]+)$/);
+  if (memberEntryMatch && req.method === 'DELETE') {
+    const id = decodeURIComponent(memberEntryMatch[1]);
+    if (id.length > 120) throw Object.assign(new Error('Invalid entry identifier.'), { status: 400 });
+    await pool.query('DELETE FROM tdci_member_entries WHERE user_id = $1 AND entry_id = $2', [user.id, id]);
+    json(res, 200, { ok: true });
+    return;
   }
   if (url.pathname === '/api/me/state' && req.method === 'PUT') {
-    const state = validState(data);
-    const result = await pool.query(`INSERT INTO tdci_member_states (user_id, state, updated_at) VALUES ($1, $2, now())
-      ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = now() RETURNING updated_at`, [user.id, state]);
-    json(res, 200, { ok: true, updated_at: result.rows[0].updated_at }); return;
+    const submitted = validState(data);
+    const entries = submitted.entries || [];
+    const metadata = { ...submitted };
+    delete metadata.entries;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(`INSERT INTO tdci_member_states (user_id, state, updated_at) VALUES ($1, $2, now())
+        ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = now() RETURNING updated_at`, [user.id, metadata]);
+      if (Array.isArray(submitted.entries)) {
+        await client.query(`INSERT INTO tdci_member_entries (user_id, entry_id, kind, activity_date, record)
+          SELECT $1, item.record->>'id', item.record->>'kind', (item.record->>'date')::date, item.record
+          FROM jsonb_array_elements($2::jsonb) AS item(record)
+          ON CONFLICT (user_id, entry_id) DO UPDATE SET kind = EXCLUDED.kind, activity_date = EXCLUDED.activity_date, record = EXCLUDED.record`, [user.id, JSON.stringify(entries)]);
+        await client.query('DELETE FROM tdci_member_entries WHERE user_id = $1 AND entry_id <> ALL($2::text[])', [user.id, entries.map(entry => entry.id)]);
+      }
+      await client.query('COMMIT');
+      json(res, 200, { ok: true, updated_at: result.rows[0].updated_at });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+    return;
   }
   if (url.pathname === '/api/church/resources' && req.method === 'PUT') {
     if (user.role !== 'admin') throw Object.assign(new Error('Only a TDCI administrator can publish church links.'), { status: 403 });
@@ -334,4 +433,19 @@ initializeDatabase().then(() => {
   process.exit(1);
 });
 
-process.on('SIGTERM', async () => { server.close(); await pool.end(); process.exit(0); });
+let isShuttingDown = false;
+function shutdown() {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  const forceExit = setTimeout(() => process.exit(1), 10_000);
+  forceExit.unref();
+  server.close(async () => {
+    clearTimeout(forceExit);
+    try { await pool.end(); process.exit(0); }
+    catch (error) { console.error('Database pool shutdown failed:', error.message); process.exit(1); }
+  });
+  server.closeIdleConnections?.();
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

@@ -4,12 +4,20 @@ Backend service for the TDCI Discipleship app. It stores each member's cloud tra
 
 ## Deploy on Render
 
-1. In Render, create a **Blueprint** from this repository and apply `render.yaml`.
+1. Create a Render Blueprint from this repository and apply `render.yaml`.
 2. The blueprint creates the Node web service and PostgreSQL database in Frankfurt.
-3. In the service environment, set `ADMIN_EMAILS` to the comma-separated email addresses allowed to manage monthly plans. Set it before those users create accounts.
-4. Wait for `/api/health` to return `{"ok":true,...}`. Enter the service's `https://…onrender.com` URL in the app's cloud settings.
+3. Set `ADMIN_EMAILS` to the comma-separated emails allowed to manage plans and church links. Do this before those people create accounts.
+4. Wait for `/api/health` to report healthy, then enter the service's HTTPS address in the app's cloud settings.
 
-The blueprint generates `SESSION_SECRET` and connects `DATABASE_URL` to its managed database. Keep both values in Render's environment settings. Do not commit `.env` files or credentials. After the first church admin signs in, they can publish the official prayer and messages Telegram links from the app's Monthly plan screen.
+The blueprint generates `SESSION_SECRET` and connects `DATABASE_URL` to its managed database. Keep both in Render's environment settings. Do not commit `.env` files or credentials. The first church admin can publish the official prayer and messages Telegram links in the app.
+
+## Scaling
+
+- Member activity is stored as rows keyed by member and entry ID. Month views use indexed, keyset-paginated queries capped at 250 entries per response. Sign-in loads private metadata and the selected month, rather than downloading every year of activity.
+- App instances are stateless: sessions and member records live in PostgreSQL, so additional API instances can serve the same accounts without sticky sessions.
+- `PG_POOL_MAX` and `PG_CONNECTION_TIMEOUT_MS` tune each instance's PostgreSQL pool. Before increasing Render instance count, keep `instance count × PG_POOL_MAX` within the database connection limit, leaving capacity for migrations and maintenance. Increase pool size only when database capacity supports it.
+- The Blueprint starts with one Starter API instance and a small paid database. Increase the API and database plans in Render as usage grows; enable additional API instances only after checking the database's connection and storage capacity. Keep the API and database in the same region.
+- PostgreSQL backups and restore procedures should be enabled and reviewed in Render before launch with real member data.
 
 ## Local run
 
@@ -27,16 +35,17 @@ The service listens on `PORT` (default `10000`). Set `ADMIN_EMAILS` and `ALLOWED
 
 ## API overview
 
-- `GET /api/health` — service/database health
-- Member accounts use `POST /api/auth/register` and `POST /api/auth/login`.
-- Church administrators use the separate `POST /api/auth/admin/register` and `POST /api/auth/admin/login` endpoints. Admin registration and login require the email to be listed in `ADMIN_EMAILS`.
+- `GET /api/health` — service and database health
+- Member accounts: `POST /api/auth/register`, `POST /api/auth/login`
+- Church admin accounts: `POST /api/auth/admin/register`, `POST /api/auth/admin/login`; admin email must be in `ADMIN_EMAILS`
 - `GET /api/auth/me`, `POST /api/auth/logout`
-- `GET`/`PUT /api/me/state` — signed-in member's private tracker
-- `GET /api/church/resources` — published church prayer and messages links (public)
+- `GET /api/me/state?includeEntries=false`, `PUT /api/me/state` — private member metadata and legacy migration path
+- `GET /api/me/entries/:YYYY-MM?limit=100&afterDate=YYYY-MM-DD&afterId=...`, `PUT /api/me/entries`, `DELETE /api/me/entries/:id` — private activity records and paginated month reads
+- `GET /api/church/resources` — published church prayer and messages links
 - `PUT /api/church/resources` — admin-only church links editor
 - `GET /api/plans/:YYYY-MM` — monthly goals
 - `PUT /api/plans/:YYYY-MM` — admin-only monthly goals
 - `POST /api/auth/delete`, `/delete-account` — account deletion
 - `/privacy` — privacy policy
 
-Passwords are stored as scrypt hashes. Session tokens are stored as hashes and sent in secure, HTTP-only cookies. Member state is keyed to the authenticated account.
+Passwords are stored as scrypt hashes. Session tokens are stored as hashes and sent in secure, HTTP-only cookies. Member activity and metadata are scoped to the authenticated account.

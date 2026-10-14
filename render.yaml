@@ -17,6 +17,10 @@ services:
           property: connectionString
       - key: SESSION_SECRET
         generateValue: true
+      - key: PG_POOL_MAX
+        value: "8"
+      - key: PG_CONNECTION_TIMEOUT_MS
+        value: "5000"
       - key: ADMIN_EMAILS
         sync: false
       - key: ALLOWED_ORIGINS
