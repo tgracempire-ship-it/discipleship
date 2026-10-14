@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: tdci-discipleship-api
+    runtime: node
+    rootDir: server
+    region: frankfurt
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tdci-discipleship-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://localhost,capacitor://localhost,http://localhost,http://127.0.0.1:4173,http://localhost:4173
+
+databases:
+  - name: tdci-discipleship-db
+    region: frankfurt
+    plan: basic-256mb
+    databaseName: tdci_discipleship
+    user: tdci_service
