@@ -1,6 +1,6 @@
 # TDCI Discipleship API
 
-Backend service for the TDCI Discipleship app. It stores each member's cloud tracker privately and lets TDCI administrators publish monthly discipleship goals.
+Backend service for the TDCI Discipleship app. It stores each member's cloud tracker privately and supports branch-specific monthly goals and church links across the TDCI network.
 
 ## Deploy on Render
 
@@ -15,6 +15,7 @@ The blueprint generates `SESSION_SECRET` and connects `DATABASE_URL` to its mana
 
 - Member activity is stored as rows keyed by member and entry ID. Month views use indexed, keyset-paginated queries capped at 250 entries per response. Sign-in loads private metadata and the selected month, rather than downloading every year of activity.
 - App instances are stateless: sessions and member records live in PostgreSQL, so additional API instances can serve the same accounts without sticky sessions.
+- Each member selects one branch at signup. Plans and Telegram resources are keyed by branch and month. Existing accounts, plans, and links are migrated into the default `main` branch. Allowlisted TDCI administrators can add branches and manage plans and links across the network; delegated branch-only admin roles are a future extension.
 - `PG_POOL_MAX` and `PG_CONNECTION_TIMEOUT_MS` tune each instance's PostgreSQL pool. Before increasing Render instance count, keep `instance count × PG_POOL_MAX` within the database connection limit, leaving capacity for migrations and maintenance. Increase pool size only when database capacity supports it.
 - The Blueprint starts with one Starter API instance and a small paid database. Increase the API and database plans in Render as usage grows; enable additional API instances only after checking the database's connection and storage capacity. Keep the API and database in the same region.
 - PostgreSQL backups and restore procedures should be enabled and reviewed in Render before launch with real member data.
@@ -36,15 +37,17 @@ The service listens on `PORT` (default `10000`). Set `ADMIN_EMAILS` and `ALLOWED
 ## API overview
 
 - `GET /api/health` — service and database health
+- `GET /api/branches` — active branch directory for sign-up
+- `POST /api/branches` — admin-only branch creation
 - Member accounts: `POST /api/auth/register`, `POST /api/auth/login`
 - Church admin accounts: `POST /api/auth/admin/register`, `POST /api/auth/admin/login`; admin email must be in `ADMIN_EMAILS`
 - `GET /api/auth/me`, `POST /api/auth/logout`
 - `GET /api/me/state?includeEntries=false`, `PUT /api/me/state` — private member metadata and legacy migration path
 - `GET /api/me/entries/:YYYY-MM?limit=100&afterDate=YYYY-MM-DD&afterId=...`, `PUT /api/me/entries`, `DELETE /api/me/entries/:id` — private activity records and paginated month reads
-- `GET /api/church/resources` — published church prayer and messages links
-- `PUT /api/church/resources` — admin-only church links editor
-- `GET /api/plans/:YYYY-MM` — monthly goals
-- `PUT /api/plans/:YYYY-MM` — admin-only monthly goals
+- `GET /api/church/resources?branchId=main` — published branch prayer and messages links
+- `PUT /api/church/resources?branchId=main` — admin-only branch links editor
+- `GET /api/plans/:YYYY-MM?branchId=main` — branch monthly goals
+- `PUT /api/plans/:YYYY-MM?branchId=main` — admin-only branch monthly goals
 - `POST /api/auth/delete`, `/delete-account` — account deletion
 - `/privacy` — privacy policy
 

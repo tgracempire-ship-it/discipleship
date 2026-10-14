@@ -24,7 +24,7 @@ const publicDir = new URL('./public/', import.meta.url);
 const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS || 'https://localhost,capacitor://localhost,http://localhost,http://127.0.0.1:4173,http://localhost:4173')
   .split(',').map(value => value.trim()).filter(Boolean));
 const adminEmails = new Set((process.env.ADMIN_EMAILS || '').split(',').map(email => email.trim().toLowerCase()).filter(Boolean));
-const policyVersion = '2026-10-14';
+const policyVersion = '2026-10-14-branches';
 const cookieName = 'tdci_session';
 const defaultTargets = { obedience: 12, scripture: 16, prayerMinutes: 180 };
 
@@ -97,15 +97,18 @@ async function createSession(res, userId) {
 async function currentUser(req) {
   const token = parseCookies(req.headers.cookie)[cookieName];
   if (!token) return null;
-  const result = await pool.query(`SELECT u.id, u.email, u.role FROM tdci_sessions s
+  const result = await pool.query(`SELECT u.id, u.email, u.role, u.branch_id FROM tdci_sessions s
     JOIN tdci_users u ON u.id = s.user_id WHERE s.token_hash = $1 AND s.expires_at > now()`, [tokenHash(token)]);
   return result.rows[0] || null;
 }
 
-function publicUser(user) { return { id: user.id, email: user.email, role: user.role }; }
+function publicUser(user) { return { id: user.id, email: user.email, role: user.role, branchId: user.branch_id || 'main' }; }
 
 async function registerAccount(data, role, res) {
   const email = emailValue(data.email);
+  const branchId = String(data.branchId || 'main').trim();
+  const branch = await pool.query('SELECT id FROM tdci_branches WHERE id = $1 AND active = true', [branchId]);
+  if (!branch.rows[0]) throw Object.assign(new Error('Choose an active TDCI branch.'), { status: 400 });
   if (role === 'admin' && !adminEmails.has(email)) {
     throw Object.assign(new Error('This email is not approved for TDCI admin access. Ask the church to add it to ADMIN_EMAILS.'), { status: 403 });
   }
@@ -117,8 +120,8 @@ async function registerAccount(data, role, res) {
   }
   const passwordHash = await hashPassword(data.password);
   try {
-    const inserted = await pool.query(`INSERT INTO tdci_users (email, password_hash, role, privacy_consent_version)
-      VALUES ($1, $2, $3, $4) RETURNING id, email, role`, [email, passwordHash, role, policyVersion]);
+    const inserted = await pool.query(`INSERT INTO tdci_users (email, password_hash, role, privacy_consent_version, branch_id)
+      VALUES ($1, $2, $3, $4, $5) RETURNING id, email, role, branch_id`, [email, passwordHash, role, policyVersion, branchId]);
     await createSession(res, inserted.rows[0].id);
     json(res, 201, { user: publicUser(inserted.rows[0]) });
   } catch (error) {
@@ -129,7 +132,7 @@ async function registerAccount(data, role, res) {
 
 async function loginAccount(data, role, res) {
   const email = emailValue(data.email);
-  const result = await pool.query('SELECT id, email, role, password_hash FROM tdci_users WHERE email = $1', [email]);
+  const result = await pool.query('SELECT id, email, role, branch_id, password_hash FROM tdci_users WHERE email = $1', [email]);
   const account = result.rows[0];
   const allowedRole = role === 'admin'
     ? account?.role === 'admin' && adminEmails.has(email)
@@ -179,6 +182,12 @@ async function initializeDatabase() {
     );
     CREATE INDEX IF NOT EXISTS tdci_member_entries_month_idx ON tdci_member_entries (user_id, activity_date, kind);
     CREATE INDEX IF NOT EXISTS tdci_member_entries_page_idx ON tdci_member_entries (user_id, activity_date, entry_id);
+    CREATE TABLE IF NOT EXISTS tdci_branches (
+      id text PRIMARY KEY,
+      name text NOT NULL,
+      active boolean NOT NULL DEFAULT true,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
     CREATE TABLE IF NOT EXISTS tdci_monthly_plans (
       month text PRIMARY KEY CHECK (month ~ '^\\d{4}-(0[1-9]|1[0-2])$'),
       targets jsonb NOT NULL,
@@ -194,6 +203,33 @@ async function initializeDatabase() {
       updated_at timestamptz NOT NULL DEFAULT now()
     );
   `);
+  await pool.query(`INSERT INTO tdci_branches (id, name) VALUES ('main', 'The Designate Church') ON CONFLICT (id) DO NOTHING`);
+  await pool.query(`ALTER TABLE tdci_users ADD COLUMN IF NOT EXISTS branch_id text NOT NULL DEFAULT 'main'`);
+  await pool.query(`DO $$ BEGIN
+    ALTER TABLE tdci_users ADD CONSTRAINT tdci_users_branch_id_fkey FOREIGN KEY (branch_id) REFERENCES tdci_branches(id);
+  EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS tdci_branch_monthly_plans (
+    branch_id text NOT NULL REFERENCES tdci_branches(id) ON DELETE CASCADE,
+    month text NOT NULL CHECK (month ~ '^\\d{4}-(0[1-9]|1[0-2])$'),
+    targets jsonb NOT NULL,
+    focus text NOT NULL DEFAULT '',
+    updated_by uuid REFERENCES tdci_users(id) ON DELETE SET NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (branch_id, month)
+  )`);
+  await pool.query(`INSERT INTO tdci_branch_monthly_plans (branch_id, month, targets, focus, updated_by, updated_at)
+    SELECT 'main', month, targets, focus, updated_by, updated_at FROM tdci_monthly_plans
+    ON CONFLICT (branch_id, month) DO NOTHING`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS tdci_branch_resources (
+    branch_id text PRIMARY KEY REFERENCES tdci_branches(id) ON DELETE CASCADE,
+    prayer_url text NOT NULL DEFAULT '',
+    messages_url text NOT NULL DEFAULT '',
+    updated_by uuid REFERENCES tdci_users(id) ON DELETE SET NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+  )`);
+  await pool.query(`INSERT INTO tdci_branch_resources (branch_id, prayer_url, messages_url, updated_by, updated_at)
+    SELECT 'main', prayer_url, messages_url, updated_by, updated_at FROM tdci_church_resources WHERE id = 'main'
+    ON CONFLICT (branch_id) DO NOTHING`);
   await pool.query(`INSERT INTO tdci_member_entries (user_id, entry_id, kind, activity_date, record)
     SELECT s.user_id, e.record->>'id', e.record->>'kind', (e.record->>'date')::date, e.record
     FROM tdci_member_states s
@@ -208,6 +244,7 @@ async function deleteAccount(userId) {
   try {
     await client.query('BEGIN');
     await client.query('UPDATE tdci_monthly_plans SET updated_by = NULL WHERE updated_by = $1', [userId]);
+    await client.query('UPDATE tdci_branch_monthly_plans SET updated_by = NULL WHERE updated_by = $1', [userId]);
     await client.query('DELETE FROM tdci_sessions WHERE user_id = $1', [userId]);
     await client.query('DELETE FROM tdci_users WHERE id = $1', [userId]);
     await client.query('COMMIT');
@@ -273,8 +310,13 @@ async function route(req, res) {
   }
 
   if (url.pathname === '/api/health' && req.method === 'GET') { await pool.query('SELECT 1'); json(res, 200, { ok: true, service: 'TDCI Discipleship API' }); return; }
+  if (url.pathname === '/api/branches' && req.method === 'GET') {
+    const result = await pool.query('SELECT id, name FROM tdci_branches WHERE active = true ORDER BY name, id');
+    json(res, 200, { branches: result.rows }); return;
+  }
   if (url.pathname === '/api/church/resources' && req.method === 'GET') {
-    const result = await pool.query('SELECT prayer_url, messages_url, updated_at FROM tdci_church_resources WHERE id = $1', ['main']);
+    const branchId = url.searchParams.get('branchId') || 'main';
+    const result = await pool.query('SELECT prayer_url, messages_url, updated_at FROM tdci_branch_resources WHERE branch_id = $1', [branchId]);
     const row = result.rows[0];
     json(res, 200, { resources: { prayerUrl: row?.prayer_url || '', messagesUrl: row?.messages_url || '' }, updated_at: row?.updated_at || null });
     return;
@@ -306,6 +348,21 @@ async function route(req, res) {
 
   const user = await currentUser(req);
   if (!user) throw Object.assign(new Error('Sign in to continue.'), { status: 401 });
+  if (url.pathname === '/api/branches' && req.method === 'POST') {
+    if (user.role !== 'admin') throw Object.assign(new Error('Only a TDCI administrator can add a branch.'), { status: 403 });
+    const name = String(data.name || '').trim();
+    if (!name || name.length > 100) throw Object.assign(new Error('Branch name must be between 1 and 100 characters.'), { status: 400 });
+    const id = String(data.id || name).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+    if (!/^[a-z0-9][a-z0-9-]{0,49}$/.test(id)) throw Object.assign(new Error('Use a branch name that can form a short URL-safe identifier.'), { status: 400 });
+    try {
+      const result = await pool.query('INSERT INTO tdci_branches (id, name) VALUES ($1, $2) RETURNING id, name', [id, name]);
+      json(res, 201, { branch: result.rows[0] });
+    } catch (error) {
+      if (error.code === '23505') throw Object.assign(new Error('A branch with this name already exists.'), { status: 409 });
+      throw error;
+    }
+    return;
+  }
   if (url.pathname === '/api/me/state' && req.method === 'GET') {
     const result = await pool.query('SELECT state, updated_at FROM tdci_member_states WHERE user_id = $1', [user.id]);
     const saved = result.rows[0]?.state || { reflections: {}, timer: null };
@@ -378,6 +435,9 @@ async function route(req, res) {
   }
   if (url.pathname === '/api/church/resources' && req.method === 'PUT') {
     if (user.role !== 'admin') throw Object.assign(new Error('Only a TDCI administrator can publish church links.'), { status: 403 });
+    const branchId = url.searchParams.get('branchId') || user.branch_id || 'main';
+    const activeBranch = await pool.query('SELECT id FROM tdci_branches WHERE id = $1 AND active = true', [branchId]);
+    if (!activeBranch.rows[0]) throw Object.assign(new Error('Choose an active TDCI branch.'), { status: 404 });
     const validLink = (value, name) => {
       const raw = String(value || '').trim();
       if (!raw) return '';
@@ -388,10 +448,10 @@ async function route(req, res) {
     };
     const prayerUrl = validLink(data.prayerUrl, 'Prayer link');
     const messagesUrl = validLink(data.messagesUrl, 'Messages link');
-    const result = await pool.query(`INSERT INTO tdci_church_resources (id, prayer_url, messages_url, updated_by, updated_at)
-      VALUES ('main', $1, $2, $3, now()) ON CONFLICT (id) DO UPDATE SET prayer_url = EXCLUDED.prayer_url,
+    const result = await pool.query(`INSERT INTO tdci_branch_resources (branch_id, prayer_url, messages_url, updated_by, updated_at)
+      VALUES ($1, $2, $3, $4, now()) ON CONFLICT (branch_id) DO UPDATE SET prayer_url = EXCLUDED.prayer_url,
       messages_url = EXCLUDED.messages_url, updated_by = EXCLUDED.updated_by, updated_at = now()
-      RETURNING prayer_url, messages_url, updated_at`, [prayerUrl, messagesUrl, user.id]);
+      RETURNING prayer_url, messages_url, updated_at`, [branchId, prayerUrl, messagesUrl, user.id]);
     const row = result.rows[0];
     json(res, 200, { resources: { prayerUrl: row.prayer_url, messagesUrl: row.messages_url }, updated_at: row.updated_at });
     return;
@@ -399,20 +459,25 @@ async function route(req, res) {
   const planMatch = url.pathname.match(/^\/api\/plans\/(\d{4}-(?:0[1-9]|1[0-2]))$/);
   if (planMatch && req.method === 'GET') {
     const month = monthValue(planMatch[1]);
-    const result = await pool.query('SELECT targets, focus, updated_at FROM tdci_monthly_plans WHERE month = $1', [month]);
+    const branchId = url.searchParams.get('branchId') || user.branch_id || 'main';
+    if (user.role !== 'admin' && branchId !== user.branch_id) throw Object.assign(new Error('Members can only view their own branch plan.'), { status: 403 });
+    const result = await pool.query('SELECT targets, focus, updated_at FROM tdci_branch_monthly_plans WHERE branch_id = $1 AND month = $2', [branchId, month]);
     const plan = result.rows[0];
     json(res, 200, { plan: plan ? { targets: plan.targets, focus: plan.focus, updated_at: plan.updated_at, unconfigured: false } : { targets: defaultTargets, focus: '', updated_at: null, unconfigured: true } }); return;
   }
   if (planMatch && req.method === 'PUT') {
     if (user.role !== 'admin') throw Object.assign(new Error('Only a TDCI administrator can publish monthly goals.'), { status: 403 });
+    const branchId = url.searchParams.get('branchId') || user.branch_id || 'main';
+    const activeBranch = await pool.query('SELECT id FROM tdci_branches WHERE id = $1 AND active = true', [branchId]);
+    if (!activeBranch.rows[0]) throw Object.assign(new Error('Choose an active TDCI branch.'), { status: 404 });
     const month = monthValue(planMatch[1]);
     const targets = data.targets;
     if (!targets || ['obedience', 'scripture', 'prayerMinutes'].some(key => !Number.isInteger(targets[key]) || targets[key] < 0 || targets[key] > 100_000)) throw Object.assign(new Error('Enter whole-number monthly targets.'), { status: 400 });
     const focus = String(data.focus || '').trim();
     if (focus.length > 500) throw Object.assign(new Error('Monthly focus must be 500 characters or fewer.'), { status: 400 });
-    const result = await pool.query(`INSERT INTO tdci_monthly_plans (month, targets, focus, updated_by, updated_at)
-      VALUES ($1, $2, $3, $4, now()) ON CONFLICT (month) DO UPDATE SET targets = EXCLUDED.targets, focus = EXCLUDED.focus, updated_by = EXCLUDED.updated_by, updated_at = now()
-      RETURNING targets, focus, updated_at`, [month, targets, focus, user.id]);
+    const result = await pool.query(`INSERT INTO tdci_branch_monthly_plans (branch_id, month, targets, focus, updated_by, updated_at)
+      VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT (branch_id, month) DO UPDATE SET targets = EXCLUDED.targets, focus = EXCLUDED.focus, updated_by = EXCLUDED.updated_by, updated_at = now()
+      RETURNING targets, focus, updated_at`, [branchId, month, targets, focus, user.id]);
     json(res, 200, { plan: { ...result.rows[0], unconfigured: false } }); return;
   }
   json(res, 404, { error: 'Not found.' });
